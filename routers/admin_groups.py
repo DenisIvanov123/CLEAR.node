@@ -1,0 +1,283 @@
+from dependencies import increment_admin_revision
+from ws_router import manager
+from fastapi import APIRouter, Depends, Request, HTTPException
+from cache import groups_cache, rights_cache, accessible_ids_cache
+from database import get_db, PgConnection
+from dependencies import require_manage_roles
+from utils import log_event
+from models import GroupCreate, PermissionSetReq, InviteReq, GroupUsersReq
+
+router = APIRouter(prefix="/admin", tags=["Admin Groups"])
+
+@router.get("/groups")
+async def get_groups(user = Depends(require_manage_roles), db: PgConnection = Depends(get_db)):
+    cached_groups = groups_cache.get("all")
+    if cached_groups: return cached_groups
+
+    c = await db.cursor()
+    await c.execute("""
+        SELECT Id, Name, IsSuperAdmin, CanManageUsers, CanSaveLocal, CanAdd, CanEdit, CanDelete, 
+               IsHidden, IsDeleted, CanReadLog, CanManageRoles, CanManageSettings, COALESCE(CanBulkEdit, 0) 
+        FROM Groups
+    """)
+    rows = await c.fetchall()
+    result = [{
+        "id": r[0], "name": r[1], "is_superadmin": bool(r[2]), "can_manage_users": bool(r[3]), "can_save_local": bool(r[4]),
+        "can_add": bool(r[5]), "can_edit": bool(r[6]), "can_delete": bool(r[7]), "is_hidden": bool(r[8]), "is_deleted": bool(r[9]),
+        "can_read_log": bool(r[10]), "can_manage_roles": bool(r[11]), "can_manage_settings": bool(r[12]),
+        "can_bulk_edit": bool(r[13])
+    } for r in rows]
+    
+    groups_cache.set("all", result)
+    return result
+
+@router.post("/groups")
+async def create_group(g: GroupCreate, request: Request, user = Depends(require_manage_roles), db: PgConnection = Depends(get_db)):
+    c = await db.cursor()
+    from utils import get_user_id
+    await c.execute("""SELECT 1 FROM Groups g JOIN UserGroups ug ON g.Id = ug.GroupId 
+                 WHERE ug.UserId = ? AND g.IsDeleted = 0 AND g.IsSuperAdmin = 1""", (get_user_id(user),))
+    caller_is_super = await c.fetchone() is not None
+
+    if g.is_superadmin and not caller_is_super:
+        raise HTTPException(403, "Только Супер-Администратор может создавать такие группы.")
+        
+    await c.execute("SELECT IsSuperAdmin FROM Groups WHERE Id = ?", (g.id,))
+    existing = await c.fetchone()
+    if existing and existing[0] == 1 and not caller_is_super:
+        raise HTTPException(403, "Вы не можете изменять группу Супер-Администратора.")
+        
+    await c.execute("""
+        INSERT INTO Groups (
+            Id, Name, IsSuperAdmin, CanManageUsers, CanSaveLocal, CanAdd, CanEdit, CanDelete, 
+            IsHidden, IsDeleted, CanReadLog, CanManageRoles, CanManageSettings, CanBulkEdit
+        ) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (Id) DO UPDATE SET
+            Name = EXCLUDED.Name,
+            IsSuperAdmin = EXCLUDED.IsSuperAdmin,
+            CanManageUsers = EXCLUDED.CanManageUsers,
+            CanSaveLocal = EXCLUDED.CanSaveLocal,
+            CanAdd = EXCLUDED.CanAdd,
+            CanEdit = EXCLUDED.CanEdit,
+            CanDelete = EXCLUDED.CanDelete,
+            IsHidden = EXCLUDED.IsHidden,
+            IsDeleted = EXCLUDED.IsDeleted,
+            CanReadLog = EXCLUDED.CanReadLog,
+            CanManageRoles = EXCLUDED.CanManageRoles,
+            CanManageSettings = EXCLUDED.CanManageSettings,
+            CanBulkEdit = EXCLUDED.CanBulkEdit
+    """, (
+        g.id, g.name, int(g.is_superadmin), int(g.can_manage_users), int(g.can_save_local), 
+        int(g.can_add), int(g.can_edit), int(g.can_delete), 
+        int(g.is_hidden), int(g.is_deleted), int(g.can_read_log), int(g.can_manage_roles), 
+        int(g.can_manage_settings), int(g.can_bulk_edit)
+    ))
+
+    await db.commit()
+    new_admin_rev = await increment_admin_revision(db)
+    await manager.broadcast({"event": "admin_revision", "revision": new_admin_rev})
+    await log_event(db, "Изменение прав", user, request.client.host, f"Обновлена группа: '{g.name}' (Массовое редактирование: {g.can_bulk_edit})")
+    
+    groups_cache.clear()
+    rights_cache.clear()
+    accessible_ids_cache.clear()
+    return {"status": "ok"}
+
+@router.delete("/groups/{group_id}")
+async def delete_group(group_id: str, request: Request, user = Depends(require_manage_roles), db: PgConnection = Depends(get_db)):
+    c = await db.cursor()
+    await c.execute("SELECT Name FROM Groups WHERE Id = ?", (group_id,))
+    row = await c.fetchone()
+    g_name = row[0] if row else "Unknown"
+    await c.execute("UPDATE Groups SET IsDeleted = 1 WHERE Id = ?", (group_id,))
+
+    await db.commit()
+    new_admin_rev = await increment_admin_revision(db)
+    await manager.broadcast({"event": "admin_revision", "revision": new_admin_rev})
+    await log_event(db, "Удаление", user, request.client.host, f"Мягкое удаление группы: '{g_name}'")
+    
+    groups_cache.clear()
+    rights_cache.clear()
+    accessible_ids_cache.clear()
+    return {"status": "ok"}
+
+@router.delete("/groups/{group_id}/permissions")
+async def clear_group_permissions(group_id: str, request: Request, user = Depends(require_manage_roles), db: PgConnection = Depends(get_db)):
+    c = await db.cursor()
+    await c.execute("UPDATE DbVersion SET Revision = Revision + 1")
+    await c.execute("SELECT Revision FROM DbVersion LIMIT 1")
+    new_rev_row = await c.fetchone()
+    new_rev = new_rev_row[0]
+    await c.execute("""
+        UPDATE Entities SET Revision = ? WHERE Id IN (
+            WITH RECURSIVE children AS (
+                SELECT EntityId AS Id FROM EntityPermissions WHERE GroupId = ?
+                UNION ALL
+                SELECT e.Id FROM Entities e JOIN children c ON e.FolderId = c.Id
+            )
+            SELECT Id FROM children
+        )
+    """, (new_rev, group_id))
+    
+    await c.execute("DELETE FROM EntityPermissions WHERE GroupId = ?", (group_id,))
+    
+    await db.commit()
+    new_admin_rev = await increment_admin_revision(db)
+    await manager.broadcast({"event": "admin_revision", "revision": new_admin_rev})
+    groups_cache.clear()
+    rights_cache.clear()
+    accessible_ids_cache.clear()
+    return {"status": "ok"}
+
+@router.get("/permissions")
+async def get_permissions(user = Depends(require_manage_roles), db: PgConnection = Depends(get_db)):
+    c = await db.cursor()
+    await c.execute("SELECT EntityId, GroupId, AccessLevel FROM EntityPermissions")
+    rows = await c.fetchall()
+    return [{"entity_id": r[0], "group_id": r[1], "access_level": r[2]} for r in rows]
+
+@router.post("/permissions")
+async def set_permission(perm: PermissionSetReq, request: Request, user = Depends(require_manage_roles), db: PgConnection = Depends(get_db)):
+    c = await db.cursor()
+    acc_level = normalize_access_level(perm.access_level)
+    await c.execute("SELECT AccessLevel FROM EntityPermissions WHERE EntityId = ? AND GroupId = ?", (perm.entity_id, perm.group_id))
+    current_perm = await c.fetchone()
+    if current_perm and current_perm[0] == acc_level:
+        return {"status": "ok"}
+        
+    await c.execute("""
+        INSERT INTO EntityPermissions (EntityId, GroupId, AccessLevel) 
+        VALUES (?, ?, ?)
+        ON CONFLICT (EntityId, GroupId) DO UPDATE SET AccessLevel = EXCLUDED.AccessLevel
+    """, (perm.entity_id, perm.group_id, acc_level))
+    
+    await c.execute("UPDATE DbVersion SET Revision = Revision + 1")
+    await c.execute("SELECT Revision FROM DbVersion LIMIT 1")
+    new_rev_row = await c.fetchone()
+    new_rev = new_rev_row[0]
+    await c.execute("""
+        UPDATE Entities SET Revision = ? WHERE Id IN (
+            WITH RECURSIVE children AS (
+                SELECT Id FROM Entities WHERE Id = ?
+                UNION ALL
+                SELECT e.Id FROM Entities e JOIN children c ON e.FolderId = c.Id
+            )
+            SELECT Id FROM children
+        )
+    """, (new_rev, perm.entity_id))
+
+    await db.commit()
+    new_admin_rev = await increment_admin_revision(db)
+    await manager.broadcast({"event": "admin_revision", "revision": new_admin_rev})
+    groups_cache.clear()
+    rights_cache.clear()
+    accessible_ids_cache.clear()
+    return {"status": "ok"}
+
+@router.post("/groups/{group_id}/permissions/bulk")
+async def save_group_permissions_bulk(
+    group_id: str,
+    permissions: list[PermissionSetReq],
+    request: Request,
+    user = Depends(require_manage_roles),
+    db: PgConnection = Depends(get_db)
+):
+    c = await db.cursor()
+
+    await c.execute("SELECT EntityId FROM EntityPermissions WHERE GroupId = ?", (group_id,))
+    old_ids = [r[0] for r in await c.fetchall()]
+    new_ids = [p.entity_id for p in permissions] if permissions else []
+    affected_ids = list(set(old_ids + new_ids))
+
+    await c.execute("DELETE FROM EntityPermissions WHERE GroupId = ?", (group_id,))
+
+    if permissions:
+        query = "INSERT INTO EntityPermissions (GroupId, EntityId, AccessLevel) VALUES (?, ?, ?) ON CONFLICT (EntityId, GroupId) DO UPDATE SET AccessLevel = EXCLUDED.AccessLevel"
+        values = [(group_id, p.entity_id, normalize_access_level(p.access_level)) for p in permissions]
+        await c.executemany(query, values)
+
+    await c.execute("INSERT INTO DbVersion (Revision) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM DbVersion)")
+    await c.execute("UPDATE DbVersion SET Revision = Revision + 1")
+    await c.execute("SELECT Revision FROM DbVersion LIMIT 1")
+
+    new_rev = (await c.fetchone())[0]
+
+    if affected_ids:
+        placeholders = ",".join("?" * len(affected_ids))
+        query_params = [new_rev] + affected_ids
+        await c.execute(f"""
+            UPDATE Entities SET Revision = ? WHERE Id IN (
+                WITH RECURSIVE children AS (
+                    SELECT Id FROM Entities WHERE Id IN ({placeholders})
+                    UNION ALL
+                    SELECT e.Id FROM Entities e JOIN children c ON e.FolderId = c.Id
+                )
+                SELECT Id FROM children
+            )
+        """, query_params)
+        
+    await db.commit()
+    
+    await log_event(db, "Изменение прав", user, request.client.host, f"Массовое обновление прав для группы {group_id}")
+
+    new_admin_rev = await increment_admin_revision(db)
+    await manager.broadcast({"event": "admin_revision", "revision": new_admin_rev})
+    await manager.broadcast({"event": "new_revision", "revision": new_rev})
+    
+    rights_cache.clear()
+    accessible_ids_cache.clear()
+    
+    return {"status": "ok"}
+
+@router.post("/invite")
+async def invite_user(req: InviteReq, request: Request, user = Depends(require_manage_roles), db: PgConnection = Depends(get_db)):
+    c = await db.cursor()
+    await c.execute("""
+        INSERT INTO UserGroups (UserId, GroupId) VALUES (?, ?)
+        ON CONFLICT (UserId, GroupId) DO NOTHING
+    """, (req.user_id, req.group_id))
+
+    await db.commit()
+    new_admin_rev = await increment_admin_revision(db)
+    await manager.broadcast({"event": "admin_revision", "revision": new_admin_rev})
+    await c.execute("SELECT Name FROM Groups WHERE Id = ?", (req.group_id,))
+    row = await c.fetchone()
+    group_name = row[0] if row else "Unknown"
+    await log_event(db, "Изменение прав", user, request.client.host, f"Отправлено приглашение пользователю {req.user_id} (Группа: {group_name})")
+    
+    groups_cache.clear()
+    rights_cache.clear()
+    accessible_ids_cache.clear()
+    return {"status": "ok"}
+
+@router.get("/groups/{group_id}/users")
+async def get_group_users(group_id: str, user = Depends(require_manage_roles), db: PgConnection = Depends(get_db)):
+    c = await db.cursor()
+    await c.execute("SELECT UserId FROM UserGroups WHERE GroupId = ?", (group_id,))
+    rows = await c.fetchall()
+    return [r[0] for r in rows]
+
+@router.post("/groups/{group_id}/users")
+async def set_group_users(group_id: str, req: GroupUsersReq, request: Request, user = Depends(require_manage_roles), db: PgConnection = Depends(get_db)):
+    c = await db.cursor()
+    await c.execute("DELETE FROM UserGroups WHERE GroupId = ?", (group_id,))
+    for uid in req.user_ids: 
+        await c.execute("INSERT INTO UserGroups (UserId, GroupId) VALUES (?, ?) ON CONFLICT (UserId, GroupId) DO NOTHING", (uid, group_id))
+    await db.commit()
+    new_admin_rev = await increment_admin_revision(db)
+    await manager.broadcast({"event": "admin_revision", "revision": new_admin_rev})
+    await log_event(db, "Изменение прав", user, request.client.host, f"Обновлен состав пользователей (Кол-во: {len(req.user_ids)}) для группы ID: {group_id}")
+    
+    groups_cache.clear()
+    rights_cache.clear()
+    accessible_ids_cache.clear()
+    return {"status": "ok"}
+    
+def normalize_access_level(level: str) -> str:
+    mapping = {
+        'Нет доступа': 'none',
+        'Чтение': 'read',
+        'Чтение / Запись': 'write'
+    }
+    return mapping.get(level, level)

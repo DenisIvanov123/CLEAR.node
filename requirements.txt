@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+requests
+asyncpg
+httpx
+uvicorn[standard]
+websockets
+python-dotenv
