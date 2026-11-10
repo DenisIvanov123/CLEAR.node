@@ -382,3 +382,10 @@ async def restore_database_backup(request: Request, user = Depends(require_manag
 
     await log_event(db, "Восстановление", user, request.client.host, f"Успешно восстановлен бэкап: {len(entities)} объектов. Ревизия: {new_rev}")
     return {"status": "ok", "restored_entities": len(entities), "new_revision": new_rev}
+
+
+@router.post("/trigger-ftp-backup")
+async def trigger_ftp_backup(user = Depends(require_manage_settings)):
+    from tasks import run_ftp_backup
+    res = await run_ftp_backup()
+    return {"status": "ok" if res else "error", "uploaded": res}
