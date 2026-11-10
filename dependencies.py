@@ -62,6 +62,8 @@ async def verify_user(authorization: Optional[str] = Header(None), db: PgConnect
     else:
         # Check if this is a local node JWT token
         local_payload = decode_jwt_token(token)
+        if not local_payload:
+            print(f"\n[AUTH REJECTED TOKEN]: token={token[:30]}... len={len(token)}\n")
         if local_payload and local_payload.get("sub"):
             sub = str(local_payload.get("sub"))
             c = await db.cursor()
