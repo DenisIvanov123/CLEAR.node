@@ -196,12 +196,12 @@ async def get_database_backup(request: Request, user = Depends(require_manage_se
     } for r in rows]
     
     # 4. Users
-    await c.execute("SELECT Id, Username, Email, IsApproved, IsActive, FirstConnect, LastConnect FROM Users")
+    await c.execute("SELECT Id, Username, Email, IsApproved, IsActive, FirstConnect, LastConnect, PasswordHash FROM Users")
     rows = await c.fetchall()
     users = [{
         "id": r[0], "username": r[1], "email": r[2], "is_approved": bool(r[3]),
         "is_active": bool(r[4]) if r[4] is not None else True,
-        "first_connect": format_dt(r[5]), "created_at": format_dt(r[5]), "last_connect": format_dt(r[6])
+        "first_connect": format_dt(r[5]), "created_at": format_dt(r[5]), "last_connect": format_dt(r[6]), "password_hash": r[7] if len(r) > 7 else ""
     } for r in rows]
     
     # 5. UserGroups
@@ -320,6 +320,36 @@ async def restore_database_backup(request: Request, user = Depends(require_manag
                   int(bool(g.get("can_manage_users"))), can_roles,
                   int(bool(g.get("can_manage_settings"))), int(bool(g.get("can_read_log"))),
                   int(bool(g.get("can_save_local", False))), int(bool(g.get("is_hidden", False))), int(bool(g.get("is_deleted", False)))))
+
+    # 2.5 Restore Users if present
+    if users:
+        for u in users:
+            uid = u.get("id")
+            uname = u.get("username")
+            if not uid or not uname:
+                continue
+            pw = u.get("password_hash") or ""
+            is_app = 1 if u.get("is_approved") else 0
+            is_act = 1 if u.get("is_active", True) else 0
+            email = u.get("email") or ""
+            await c.execute("""
+                INSERT INTO Users (Id, Username, Email, PasswordHash, IsApproved, IsActive)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (Id) DO UPDATE SET
+                    Username = EXCLUDED.Username,
+                    Email = EXCLUDED.Email,
+                    PasswordHash = CASE WHEN EXCLUDED.PasswordHash != '' THEN EXCLUDED.PasswordHash ELSE Users.PasswordHash END,
+                    IsApproved = EXCLUDED.IsApproved,
+                    IsActive = EXCLUDED.IsActive
+            """, (uid, uname, email, pw, is_app, is_act))
+
+    # 2.6 Restore UserGroups if present
+    if user_groups:
+        for ug in user_groups:
+            u_id = ug.get("user_id")
+            g_id = ug.get("group_id")
+            if u_id and g_id:
+                await c.execute("INSERT INTO UserGroups (UserId, GroupId) VALUES (?, ?) ON CONFLICT DO NOTHING", (u_id, g_id))
 
     # 3. Restore EntityPermissions
     if entity_permissions:
