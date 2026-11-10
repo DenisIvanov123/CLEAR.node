@@ -7,3 +7,5 @@ httpx
 uvicorn[standard]
 websockets
 python-dotenv
+aiofiles
+cryptography
