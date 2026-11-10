@@ -54,37 +54,37 @@ async def run_ftp_backup():
                 if not backup_json:
                     print(f"[FTP BACKUP ERROR] Failed to export {node_id} from all candidates: {last_err}")
                     continue
-            tar_buf = io.BytesIO()
-            with tarfile.open(fileobj=tar_buf, mode="w:gz") as tar:
-                # 1. Full JSON Application Data
-                json_bytes = io.BytesIO(backup_json)
-                ti = tarfile.TarInfo(name=f"{node_id}_export.json")
-                ti.size = len(backup_json)
-                ti.mtime = int(time.time())
-                tar.addfile(ti, json_bytes)
-
-                # 2. Complete PostgreSQL SQL Dump (.sql)
-                try:
-                    from sql_generator import json_to_sql_dump
-                    backup_dict = json.loads(backup_json.decode("utf-8"))
-                    db_name = "clear_rms_db" if node_id == "node1" else "clear_terminal_db"
-                    sql_text = json_to_sql_dump(backup_dict, db_name)
-                    sql_bytes = sql_text.encode("utf-8")
-                    
-                    sql_ti = tarfile.TarInfo(name=f"{node_id}_full_dump.sql")
-                    sql_ti.size = len(sql_bytes)
-                    sql_ti.mtime = int(time.time())
-                    tar.addfile(sql_ti, io.BytesIO(sql_bytes))
-                    print(f"[FTP BACKUP] Added full PostgreSQL SQL dump ({len(sql_bytes)} bytes) to {node_id}")
-                except Exception as e:
-                    print(f"[FTP BACKUP ERROR] Failed to generate SQL dump for {node_id}: {e}")
-
-            tar_buf.seek(0)
-            archive_name = f"clear_db_{node_id}_{timestamp_str}.tar.gz"
-            archives.append((archive_name, tar_buf))
-            print(f"[FTP BACKUP] In-memory archive {archive_name}: {len(tar_buf.getvalue())} bytes")
-        except Exception as e:
-            print(f"[FTP BACKUP ERROR] Failed to export {node_id}: {e}")
+                tar_buf = io.BytesIO()
+                with tarfile.open(fileobj=tar_buf, mode="w:gz") as tar:
+                    # 1. Full JSON Application Data
+                    json_bytes = io.BytesIO(backup_json)
+                    ti = tarfile.TarInfo(name=f"{node_id}_export.json")
+                    ti.size = len(backup_json)
+                    ti.mtime = int(time.time())
+                    tar.addfile(ti, json_bytes)
+    
+                    # 2. Complete PostgreSQL SQL Dump (.sql)
+                    try:
+                        from sql_generator import json_to_sql_dump
+                        backup_dict = json.loads(backup_json.decode("utf-8"))
+                        db_name = "clear_rms_db" if node_id == "node1" else "clear_terminal_db"
+                        sql_text = json_to_sql_dump(backup_dict, db_name)
+                        sql_bytes = sql_text.encode("utf-8")
+                        
+                        sql_ti = tarfile.TarInfo(name=f"{node_id}_full_dump.sql")
+                        sql_ti.size = len(sql_bytes)
+                        sql_ti.mtime = int(time.time())
+                        tar.addfile(sql_ti, io.BytesIO(sql_bytes))
+                        print(f"[FTP BACKUP] Added full PostgreSQL SQL dump ({len(sql_bytes)} bytes) to {node_id}")
+                    except Exception as e:
+                        print(f"[FTP BACKUP ERROR] Failed to generate SQL dump for {node_id}: {e}")
+    
+                tar_buf.seek(0)
+                archive_name = f"clear_db_{node_id}_{timestamp_str}.tar.gz"
+                archives.append((archive_name, tar_buf))
+                print(f"[FTP BACKUP] In-memory archive {archive_name}: {len(tar_buf.getvalue())} bytes")
+            except Exception as e:
+                print(f"[FTP BACKUP ERROR] Failed to export {node_id}: {e}")
             
     if not archives:
         print("[FTP BACKUP ERROR] No archives created, aborting upload.")
