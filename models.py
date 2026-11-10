@@ -50,3 +50,32 @@ class ServerSettingsReq(BaseModel):
     audit_retention_days: int
     deleted_retention_days: int
     default_group_id: str
+
+class UserCreateReq(BaseModel):
+    username: str
+    email: Optional[str] = ""
+    password: str
+    group_id: Optional[str] = ""
+
+class UserResetPasswordReq(BaseModel):
+    new_password: str
+
+class LoginReq(BaseModel):
+    username: str
+    password: str
+
+class ChangePasswordReq(BaseModel):
+    old_password: str
+    new_password: str
+
+
+
+class ClientLogEntry(BaseModel):
+    level: str = "ERROR"
+    message: str
+    stack_trace: Optional[str] = ""
+    app_version: Optional[str] = ""
+    timestamp: Optional[str] = None
+
+class ClientLogsBatchReq(BaseModel):
+    logs: List[ClientLogEntry]
