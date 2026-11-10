@@ -6,7 +6,7 @@ from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
 from contextlib import asynccontextmanager
 
 import logger
@@ -40,17 +40,42 @@ app.add_middleware(
 )
 
 @app.get("/docs", include_in_schema=False)
-async def custom_swagger_ui_html(req: Request):
-    path = req.url.path.rstrip("/")
-    base = path[:-5] if path.endswith("/docs") else ""
-    openapi_url = f"{base}/openapi.json" if base else "/openapi.json"
-    return get_swagger_ui_html(
-        openapi_url=openapi_url,
-        title=app.title + " - Swagger UI",
-        oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
-        swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
-        swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css",
-    )
+@app.get("/rdm/docs", include_in_schema=False)
+@app.get("/rms/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    html = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>CLEAR.node - Swagger UI</title>
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+    <link rel="shortcut icon" href="https://fastapi.tiangolo.com/img/favicon.png">
+</head>
+<body>
+    <div id="swagger-ui"></div>
+    <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+        const basePath = window.location.pathname.replace(/\\/docs\\/?$/, '');
+        const openapiUrl = (basePath ? basePath : '') + '/openapi.json';
+        window.ui = SwaggerUIBundle({
+            url: openapiUrl,
+            dom_id: '#swagger-ui',
+            deepLinking: true,
+            presets: [
+                SwaggerUIBundle.presets.apis,
+                SwaggerUIBundle.SwaggerUIStandalonePreset
+            ],
+            layout: "BaseLayout"
+        });
+    </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+@app.get("/rdm/openapi.json", include_in_schema=False)
+@app.get("/rms/openapi.json", include_in_schema=False)
+def custom_openapi():
+    return JSONResponse(app.openapi())
 
 @app.get("/ping")
 @app.get("/health")
