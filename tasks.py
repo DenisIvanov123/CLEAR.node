@@ -42,15 +42,34 @@ async def run_ftp_backup():
             req_b = urllib.request.Request(backup_url, headers={"Authorization": f"Bearer {token}"})
             with urllib.request.urlopen(req_b, timeout=60) as resp:
                 backup_json = resp.read()
-                
             tar_buf = io.BytesIO()
             with tarfile.open(fileobj=tar_buf, mode="w:gz") as tar:
+                # 1. Full JSON Application Data
                 json_bytes = io.BytesIO(backup_json)
                 ti = tarfile.TarInfo(name=f"{node_id}_export.json")
                 ti.size = len(backup_json)
                 ti.mtime = int(time.time())
                 tar.addfile(ti, json_bytes)
-                
+
+                # 2. Complete PostgreSQL SQL Dump
+                try:
+                    env = os.environ.copy()
+                    env["PGPASSWORD"] = "ClearNode_Pass_2026!"
+                    db_name = "clear_rms_db" if node_id == "node1" else "clear_terminal_db"
+                    proc = await asyncio.create_subprocess_exec(
+                        "pg_dump", "-h", "postgres", "-U", "clear_admin", "-d", db_name, "--clean", "--if-exists",
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env
+                    )
+                    stdout, _ = await proc.communicate()
+                    if stdout:
+                        sql_ti = tarfile.TarInfo(name=f"{node_id}_full_dump.sql")
+                        sql_ti.size = len(stdout)
+                        sql_ti.mtime = int(time.time())
+                        tar.addfile(sql_ti, io.BytesIO(stdout))
+                        print(f"[FTP BACKUP] Added full pg_dump SQL ({len(stdout)} bytes) to {node_id}")
+                except Exception as e:
+                    print(f"[FTP BACKUP] pg_dump skipped: {e}")
+
             tar_buf.seek(0)
             archive_name = f"clear_db_{node_id}_{timestamp_str}.tar.gz"
             archives.append((archive_name, tar_buf))
