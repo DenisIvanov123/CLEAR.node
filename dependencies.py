@@ -1,13 +1,16 @@
 import httpx
 import hashlib
+from typing import Optional
 from datetime import datetime, timezone
 from fastapi import Header, HTTPException, Depends
 from config import CENTRAL_AUTH_URL
 from database import get_db, PgConnection
-from utils import get_user_id
+from utils import get_user_id, decode_jwt_token
 from cache import auth_cache
 
-async def verify_user(authorization: str = Header(...), db: PgConnection = Depends(get_db)):
+async def verify_user(authorization: Optional[str] = Header(None), db: PgConnection = Depends(get_db)):
+    if not authorization:
+        raise HTTPException(401, "Authorization header required")
     if not authorization.startswith("Bearer "): 
         raise HTTPException(401, "Invalid token format")
     
@@ -57,6 +60,28 @@ async def verify_user(authorization: str = Header(...), db: PgConnection = Depen
         auth_cache.set(token, result)
         return result
     else:
+        # Check if this is a local node JWT token
+        local_payload = decode_jwt_token(token)
+        if local_payload and local_payload.get("sub"):
+            sub = str(local_payload.get("sub"))
+            c = await db.cursor()
+            await c.execute("SELECT Id, Username, Email, IsActive, IsApproved FROM Users WHERE Id = ? OR LOWER(Username) = LOWER(?)", (sub, sub))
+            u_row = await c.fetchone()
+            if not u_row:
+                raise HTTPException(401, "User not found")
+            if u_row[3] is not None and not bool(u_row[3]):
+                raise HTTPException(403, "User account is disabled")
+            if u_row[4] is not None and not bool(u_row[4]):
+                raise HTTPException(403, "User account is not approved")
+            user_data = {
+                "id": str(u_row[0]),
+                "username": u_row[1] or sub,
+                "email": u_row[2] or local_payload.get("email", ""),
+                "is_local_token": False
+            }
+            auth_cache.set(token, user_data)
+            return user_data
+
         try:
             custom_headers = {
                 "Authorization": authorization,
