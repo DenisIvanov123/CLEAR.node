@@ -5,7 +5,7 @@ import json
 import asyncio
 import ftplib
 import tarfile
-import urllib.request
+import httpx
 from datetime import datetime, timezone, timedelta
 from database import get_pool, PgConnection
 from ws_router import manager
@@ -29,34 +29,31 @@ async def run_ftp_backup():
     ]
     
     archives = []
-    import ssl
-    ssl_ctx = ssl._create_unverified_context()
     
-    for node_id, candidate_urls in nodes_info:
-        try:
-            backup_json = None
-            last_err = None
-            for base_url in candidate_urls:
-                try:
-                    login_url = f"{base_url}/auth/login"
-                    payload = json.dumps({"username": "Deniska", "password": "341049"}).encode("utf-8")
-                    req = urllib.request.Request(login_url, data=payload, headers={"Content-Type": "application/json"})
-                    with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
-                        token = json.loads(resp.read().decode("utf-8"))["access_token"]
+    async with httpx.AsyncClient(verify=False, timeout=60.0) as client:
+        for node_id, candidate_urls in nodes_info:
+            try:
+                backup_json = None
+                last_err = None
+                for base_url in candidate_urls:
+                    try:
+                        login_resp = await client.post(f"{base_url}/auth/login", json={"username": "Deniska", "password": "341049"})
+                        if login_resp.status_code != 200:
+                            continue
+                        token = login_resp.json().get("access_token")
+                        if not token:
+                            continue
+                        backup_resp = await client.get(f"{base_url}/admin/backup", headers={"Authorization": f"Bearer {token}"})
+                        if backup_resp.status_code == 200:
+                            backup_json = backup_resp.content
+                            break
+                    except Exception as e_candidate:
+                        last_err = e_candidate
+                        continue
                         
-                    backup_url = f"{base_url}/admin/backup"
-                    req_b = urllib.request.Request(backup_url, headers={"Authorization": f"Bearer {token}"})
-                    with urllib.request.urlopen(req_b, timeout=60, context=ssl_ctx) as resp:
-                        backup_json = resp.read()
-                    if backup_json:
-                        break
-                except Exception as e_candidate:
-                    last_err = e_candidate
+                if not backup_json:
+                    print(f"[FTP BACKUP ERROR] Failed to export {node_id} from all candidates: {last_err}")
                     continue
-                    
-            if not backup_json:
-                print(f"[FTP BACKUP ERROR] Failed to export {node_id} from all candidates: {last_err}")
-                continue
             tar_buf = io.BytesIO()
             with tarfile.open(fileobj=tar_buf, mode="w:gz") as tar:
                 # 1. Full JSON Application Data
