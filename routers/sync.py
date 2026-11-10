@@ -47,7 +47,7 @@ async def get_my_rights(user = Depends(verify_user), db: PgConnection = Depends(
     username = user.get("username", "Unknown")
     email = user.get("email", "")
 
-    await c.execute("SELECT IsApproved FROM Users WHERE Id = ?", (user_id,))
+    await c.execute("SELECT Id, IsApproved, IsActive FROM Users WHERE Id = ? OR LOWER(Username) = LOWER(?)", (user_id, username))
     user_row = await c.fetchone()
 
     if not user_row:
@@ -83,17 +83,11 @@ async def get_my_rights(user = Depends(verify_user), db: PgConnection = Depends(
             is_approved = False
         await db.commit()
     else:
-        is_approved = bool(user_row[0])
-        try:
-            await c.execute("SELECT IsActive FROM Users WHERE Id = ?", (user_id,))
-            act_row = await c.fetchone()
-            if act_row and act_row[0] is not None and not bool(act_row[0]):
-                raise HTTPException(403, "Account disabled by administrator")
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-        await c.execute("UPDATE Users SET LastConnect = NOW(), Username = ?, Email = ? WHERE Id = ?", (username, email, user_id))
+        user_id = str(user_row[0])
+        is_approved = bool(user_row[1])
+        if user_row[2] is not None and not bool(user_row[2]):
+            raise HTTPException(403, "Account disabled by administrator")
+        await c.execute("UPDATE Users SET LastConnect = NOW() WHERE Id = ?", (user_id,))
         await db.commit()
 
     r = { 
@@ -200,7 +194,7 @@ async def get_accessible_ids(user = Depends(verify_user), db: PgConnection = Dep
     is_super = await c.fetchone() is not None
 
     if is_super:
-        await c.execute("SELECT Id FROM Entities WHERE Deleted = 0")
+        await c.execute("SELECT Id FROM Entities")
     else:
         query = """
         WITH RECURSIVE
@@ -208,8 +202,8 @@ async def get_accessible_ids(user = Depends(verify_user), db: PgConnection = Dep
             SELECT e.Id, e.FolderId,
                 CASE WHEN EXISTS (SELECT 1 FROM EntityPermissions WHERE EntityId = e.Id) THEN 1 ELSE 0 END AS HasRestrict,
                 CASE 
-                    WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('Нет доступа', 'none') AND g.IsDeleted = 0) THEN 0
-                    WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('Чтение', 'Чтение / Запись', 'read', 'write') AND g.IsDeleted = 0) THEN 1 
+                    WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('none', 'запрещено', 'нет') AND g.IsDeleted = 0) THEN 0
+                    WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('чтение', 'чтение / запись', 'полный', 'read', 'write', 'full') AND g.IsDeleted = 0) THEN 1 
                     ELSE 0 
                 END AS HasAccess
             FROM Entities e
@@ -222,8 +216,8 @@ async def get_accessible_ids(user = Depends(verify_user), db: PgConnection = Dep
                 CASE
                     WHEN EXISTS (SELECT 1 FROM EntityPermissions WHERE EntityId = e.Id) THEN
                         CASE 
-                            WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('Нет доступа', 'none') AND g.IsDeleted = 0) THEN 0
-                            WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('Чтение', 'Чтение / Запись', 'read', 'write') AND g.IsDeleted = 0) THEN 1 
+                            WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('none', 'запрещено', 'нет') AND g.IsDeleted = 0) THEN 0
+                            WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('чтение', 'чтение / запись', 'полный', 'read', 'write', 'full') AND g.IsDeleted = 0) THEN 1 
                             ELSE ea.HasAccess 
                         END
                     ELSE ea.HasAccess
@@ -234,7 +228,7 @@ async def get_accessible_ids(user = Depends(verify_user), db: PgConnection = Dep
         SELECT e.Id
         FROM Entities e
         JOIN EntityAccess ea ON e.Id = ea.Id
-        WHERE e.Deleted = 0 AND (ea.HasRestrict = 0 OR ea.HasAccess = 1)
+        WHERE (ea.HasRestrict = 0 OR ea.HasAccess = 1)
         """
         await c.execute(query, (user_id, user_id, user_id, user_id))
 
@@ -264,8 +258,8 @@ async def pull_data(since_revision: int = 0, request: Request = None, user = Dep
             SELECT e.Id, e.FolderId,
                 CASE WHEN EXISTS (SELECT 1 FROM EntityPermissions WHERE EntityId = e.Id) THEN 1 ELSE 0 END AS HasRestrict,
                 CASE 
-                    WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('Нет доступа', 'none') AND g.IsDeleted = 0) THEN 0
-                    WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('Чтение', 'Чтение / Запись', 'read', 'write') AND g.IsDeleted = 0) THEN 1 
+                    WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('none', 'запрещено', 'нет') AND g.IsDeleted = 0) THEN 0
+                    WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('чтение', 'чтение / запись', 'полный', 'read', 'write', 'full') AND g.IsDeleted = 0) THEN 1 
                     ELSE 0 
                 END AS HasAccess
             FROM Entities e
@@ -278,8 +272,8 @@ async def pull_data(since_revision: int = 0, request: Request = None, user = Dep
                 CASE
                     WHEN EXISTS (SELECT 1 FROM EntityPermissions WHERE EntityId = e.Id) THEN
                         CASE 
-                            WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('Нет доступа', 'none') AND g.IsDeleted = 0) THEN 0
-                            WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('Чтение', 'Чтение / Запись', 'read', 'write') AND g.IsDeleted = 0) THEN 1 
+                            WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('none', 'запрещено', 'нет') AND g.IsDeleted = 0) THEN 0
+                            WHEN EXISTS (SELECT 1 FROM EntityPermissions ep JOIN UserGroups ug ON ep.GroupId = ug.GroupId JOIN Groups g ON g.Id = ug.GroupId WHERE ep.EntityId = e.Id AND ug.UserId = ? AND ep.AccessLevel IN ('чтение', 'чтение / запись', 'полный', 'read', 'write', 'full') AND g.IsDeleted = 0) THEN 1 
                             ELSE ea.HasAccess 
                         END
                     ELSE ea.HasAccess
