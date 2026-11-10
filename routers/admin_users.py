@@ -3,8 +3,9 @@ from ws_router import manager
 from fastapi import APIRouter, Depends, Request, HTTPException
 from cache import auth_cache, rights_cache, accessible_ids_cache, users_cache, pending_cache, groups_cache
 from database import get_db, PgConnection
-from utils import log_event, get_user_id
-from models import UserGroupUpdate
+from utils import log_event, get_user_id, hash_password, get_master_key, encrypt_plain_password, decrypt_plain_password
+import uuid
+from models import UserGroupUpdate, UserCreateReq, UserResetPasswordReq
 from datetime import datetime
 
 router = APIRouter(prefix="/admin", tags=["Admin Users"])
@@ -24,12 +25,13 @@ async def get_all_users(user = Depends(require_manage_users), db: PgConnection =
         c = await db.cursor()
         try:
             await c.execute("""
-                SELECT u.Id, u.Username, u.Email, u.LastConnect, ug.GroupId, u.IsActive 
+                SELECT u.Id, u.Username, u.Email, u.LastConnect, ug.GroupId, u.IsActive, COALESCE(u.PlainPassword, '') 
                 FROM Users u 
                 LEFT JOIN UserGroups ug ON u.Id = ug.UserId 
                 WHERE u.IsApproved = 1 ORDER BY u.LastConnect DESC
             """)
             rows = await c.fetchall()
+            master_key = await get_master_key(db)
             
             cached_users = [{
                 "id": r[0], 
@@ -37,7 +39,8 @@ async def get_all_users(user = Depends(require_manage_users), db: PgConnection =
                 "email": r[2], 
                 "last_connect": format_dt(r[3]), 
                 "group_id": r[4] if r[4] else "", 
-                "is_active": bool(r[5] if r[5] is not None else 1)
+                "is_active": bool(r[5] if r[5] is not None else 1),
+                "plain_password": decrypt_plain_password(r[6], master_key) if len(r) > 6 and r[6] else ""
             } for r in rows]
             
             users_cache.set("all", cached_users)
@@ -204,3 +207,90 @@ async def restore_user(target_user_id: str, request: Request, user = Depends(req
     accessible_ids_cache.clear()
     users_cache.clear()
     return {"status": "ok"}
+
+
+@router.post("/users/create")
+async def create_user(req: UserCreateReq, request: Request, user = Depends(require_manage_users), db: PgConnection = Depends(get_db)):
+    username = req.username.strip()
+    if not username:
+        raise HTTPException(400, "Имя пользователя не может быть пустым")
+    if not req.password:
+        raise HTTPException(400, "Пароль не может быть пустым")
+        
+    c = await db.cursor()
+    await c.execute("SELECT Id, IsApproved FROM Users WHERE LOWER(Username) = LOWER(?)", (username,))
+    existing = await c.fetchone()
+    now = datetime.now()
+    pw_hash = hash_password(req.password)
+
+    if existing:
+        if existing[1] == 1:
+            raise HTTPException(400, "Пользователь с таким логином уже существует")
+        else:
+            user_id = existing[0]
+            master_key = await get_master_key(db)
+            enc_pw = encrypt_plain_password(req.password, master_key)
+            await c.execute("""
+                UPDATE Users SET PasswordHash = ?, PlainPassword = ?, Email = ?, IsApproved = 1, IsActive = 1, LastConnect = ?
+                WHERE Id = ?
+            """, (pw_hash, enc_pw, req.email or "", now, user_id))
+            if req.group_id:
+                await c.execute("DELETE FROM UserGroups WHERE UserId = ?", (user_id,))
+                await c.execute("INSERT INTO UserGroups (UserId, GroupId) VALUES (?, ?)", (user_id, req.group_id))
+            await db.commit()
+            users_cache.clear()
+            pending_cache.clear()
+            new_admin_rev = await increment_admin_revision(db)
+            await manager.broadcast({"event": "admin_revision", "revision": new_admin_rev})
+            client_ip = request.client.host if request.client else "unknown"
+            await log_event(db, "UserCreate", user, client_ip, f"Создан/активирован пользователь {username}")
+            return {"status": "ok", "user_id": user_id, "username": username}
+
+    user_id = str(uuid.uuid4())
+    
+    master_key = await get_master_key(db)
+    enc_pw = encrypt_plain_password(req.password, master_key)
+    await c.execute("""
+        INSERT INTO Users (Id, Username, Email, PasswordHash, PlainPassword, FirstConnect, LastConnect, IsApproved, IsActive)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1)
+    """, (user_id, username, req.email or "", pw_hash, enc_pw, now, now))
+    
+    if req.group_id:
+        await c.execute("DELETE FROM UserGroups WHERE UserId = ?", (user_id,))
+        await c.execute("INSERT INTO UserGroups (UserId, GroupId) VALUES (?, ?)", (user_id, req.group_id))
+        
+    await db.commit()
+    users_cache.clear()
+    
+    new_admin_rev = await increment_admin_revision(db)
+    await manager.broadcast({"event": "admin_revision", "revision": new_admin_rev})
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await log_event(db, "UserCreate", user, client_ip, f"Создан пользователь {username}")
+    
+    return {"status": "ok", "user_id": user_id, "username": username}
+
+@router.post("/users/{target_user_id}/reset_password")
+async def reset_password(target_user_id: str, req: UserResetPasswordReq, request: Request, user = Depends(require_manage_users), db: PgConnection = Depends(get_db)):
+    if not req.new_password:
+        raise HTTPException(400, "Новый пароль не может быть пустым")
+        
+    c = await db.cursor()
+    await c.execute("SELECT Id, Username FROM Users WHERE Id = ?", (target_user_id,))
+    row = await c.fetchone()
+    if not row:
+        raise HTTPException(404, "Пользователь не найден")
+        
+    target_username = row[1]
+    pw_hash = hash_password(req.new_password)
+    master_key = await get_master_key(db)
+    enc_pw = encrypt_plain_password(req.new_password, master_key)
+    
+    await c.execute("UPDATE Users SET PasswordHash = ?, PlainPassword = ?, must_change_password = 0 WHERE Id = ? OR LOWER(Username) = LOWER(?)", (pw_hash, enc_pw, target_user_id, target_username))
+    await db.commit()
+    
+    auth_cache.clear()
+    client_ip = request.client.host if request.client else "unknown"
+    await log_event(db, "PasswordReset", user, client_ip, f"Сброшен пароль пользователя {target_username}")
+    
+    return {"status": "ok", "message": f"Пароль для {target_username} успешно обновлен"}
