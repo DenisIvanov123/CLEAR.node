@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: clear_node_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: clear_admin
+      POSTGRES_PASSWORD: ClearNode_Pass_2026!
+      POSTGRES_DB: clear_rms_db
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clear_admin -d clear_rms_db && (psql -U clear_admin -d clear_rms_db -tc \"SELECT 1 FROM pg_database WHERE datname = 'clear_terminal_db'\" | grep -q 1 || psql -U clear_admin -d clear_rms_db -c \"CREATE DATABASE clear_terminal_db;\")"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Сервер 1: RMS / Офисы (порт 8010)
+  clear-node-rms:
+    image: python:3.11-slim
+    container_name: clear_node_rms
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      sh -c "apt-get update && apt-get install -y git &&
+             git clone https://github.com/DenisIvanov123/CLEAR.node.git /app &&
+             cd /app &&
+             pip install --no-cache-dir -r requirements.txt &&
+             uvicorn main:app --host 0.0.0.0 --port 8010"
+    environment:
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_USER=clear_admin
+      - PG_PASSWORD=ClearNode_Pass_2026!
+      - PG_DATABASE=clear_rms_db
+      - NODE_SECRET_KEY=CLEAR_NODE_SECRET_KEY_AUTO_2026
+      - HOST=0.0.0.0
+      - PORT=8010
+    ports:
+      - "8010:8010"
+
+  # Сервер 2: Терминалы / Кассы / РДМ (порт 8011)
+  clear-node-terminal:
+    image: python:3.11-slim
+    container_name: clear_node_terminal
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      sh -c "apt-get update && apt-get install -y git &&
+             git clone https://github.com/DenisIvanov123/CLEAR.node.git /app &&
+             cd /app &&
+             pip install --no-cache-dir -r requirements.txt &&
+             uvicorn main:app --host 0.0.0.0 --port 8011"
+    environment:
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_USER=clear_admin
+      - PG_PASSWORD=ClearNode_Pass_2026!
+      - PG_DATABASE=clear_terminal_db
+      - NODE_SECRET_KEY=CLEAR_NODE_SECRET_KEY_AUTO_2026
+      - HOST=0.0.0.0
+      - PORT=8011
+    ports:
+      - "8011:8011"
+
+volumes:
+  pg_data:
