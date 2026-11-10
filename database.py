@@ -232,6 +232,7 @@ async def init_db():
                 Id TEXT PRIMARY KEY,
                 Username TEXT,
                 Email TEXT,
+                PlainPassword TEXT DEFAULT '',
                 FirstConnect TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                 LastConnect TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                 IsApproved INTEGER DEFAULT 0,
@@ -294,6 +295,19 @@ async def init_db():
         """)
 
         await c.execute("""
+            CREATE TABLE IF NOT EXISTS ClientLogs (
+                Id SERIAL PRIMARY KEY,
+                Timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                Username TEXT DEFAULT '',
+                ClientIp TEXT DEFAULT '',
+                LogLevel TEXT DEFAULT 'INFO',
+                Message TEXT,
+                StackTrace TEXT DEFAULT '',
+                AppVersion TEXT DEFAULT ''
+            )
+        """)
+
+        await c.execute("""
             CREATE TABLE IF NOT EXISTS AuditLog (
                 Id SERIAL PRIMARY KEY,
                 Timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -316,6 +330,8 @@ async def init_db():
         try: await c.execute("ALTER TABLE Groups ADD COLUMN IF NOT EXISTS CanBulkEdit INTEGER DEFAULT 0")
         except: pass
         try: await c.execute("ALTER TABLE Users ADD COLUMN IF NOT EXISTS IsActive INTEGER DEFAULT 1")
+        except: pass
+        try: await c.execute("ALTER TABLE Users ADD COLUMN IF NOT EXISTS PlainPassword TEXT DEFAULT ''")
         except: pass
         try: await c.execute("ALTER TABLE LocalTokens ADD COLUMN IF NOT EXISTS IsActive INTEGER DEFAULT 1")
         except: pass
