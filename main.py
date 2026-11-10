@@ -13,19 +13,25 @@ import logger
 from database import init_db
 from routers import sync, admin_users, admin_groups, admin_system, auth, client_logs
 from ws_router import router as ws_router
-from tasks import background_cleanup_task
+from tasks import background_cleanup_task, background_ftp_backup_task
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
 
     cleanup_task = asyncio.create_task(background_cleanup_task())
+    backup_task = asyncio.create_task(background_ftp_backup_task())
 
     yield
 
     cleanup_task.cancel()
+    backup_task.cancel()
     try:
         await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await backup_task
     except asyncio.CancelledError:
         pass
 
