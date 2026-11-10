@@ -51,24 +51,21 @@ async def run_ftp_backup():
                 ti.mtime = int(time.time())
                 tar.addfile(ti, json_bytes)
 
-                # 2. Complete PostgreSQL SQL Dump
+                # 2. Complete PostgreSQL SQL Dump (.sql)
                 try:
-                    env = os.environ.copy()
-                    env["PGPASSWORD"] = "ClearNode_Pass_2026!"
+                    from sql_generator import json_to_sql_dump
+                    backup_dict = json.loads(backup_json.decode("utf-8"))
                     db_name = "clear_rms_db" if node_id == "node1" else "clear_terminal_db"
-                    proc = await asyncio.create_subprocess_exec(
-                        "pg_dump", "-h", "postgres", "-U", "clear_admin", "-d", db_name, "--clean", "--if-exists",
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env
-                    )
-                    stdout, _ = await proc.communicate()
-                    if stdout:
-                        sql_ti = tarfile.TarInfo(name=f"{node_id}_full_dump.sql")
-                        sql_ti.size = len(stdout)
-                        sql_ti.mtime = int(time.time())
-                        tar.addfile(sql_ti, io.BytesIO(stdout))
-                        print(f"[FTP BACKUP] Added full pg_dump SQL ({len(stdout)} bytes) to {node_id}")
+                    sql_text = json_to_sql_dump(backup_dict, db_name)
+                    sql_bytes = sql_text.encode("utf-8")
+                    
+                    sql_ti = tarfile.TarInfo(name=f"{node_id}_full_dump.sql")
+                    sql_ti.size = len(sql_bytes)
+                    sql_ti.mtime = int(time.time())
+                    tar.addfile(sql_ti, io.BytesIO(sql_bytes))
+                    print(f"[FTP BACKUP] Added full PostgreSQL SQL dump ({len(sql_bytes)} bytes) to {node_id}")
                 except Exception as e:
-                    print(f"[FTP BACKUP] pg_dump skipped: {e}")
+                    print(f"[FTP BACKUP ERROR] Failed to generate SQL dump for {node_id}: {e}")
 
             tar_buf.seek(0)
             archive_name = f"clear_db_{node_id}_{timestamp_str}.tar.gz"
