@@ -183,25 +183,25 @@ async def get_database_backup(request: Request, user = Depends(require_manage_se
     # 3. Groups
     await c.execute("""
         SELECT Id, Name, IsSuperAdmin, CanAdd, CanEdit, CanDelete, CanBulkEdit,
-               CanManageUsers, CanManageGroups, CanManageSettings, CanReadLog, IsDeleted, CreatedAt
+               CanManageUsers, CanManageRoles, CanManageSettings, CanReadLog, CanSaveLocal, IsHidden, IsDeleted
         FROM Groups
     """)
     rows = await c.fetchall()
     groups = [{
         "id": r[0], "name": r[1], "is_superadmin": bool(r[2]), "can_add": bool(r[3]),
         "can_edit": bool(r[4]), "can_delete": bool(r[5]), "can_bulk_edit": bool(r[6]),
-        "can_manage_users": bool(r[7]), "can_manage_groups": bool(r[8]),
+        "can_manage_users": bool(r[7]), "can_manage_roles": bool(r[8]), "can_manage_groups": bool(r[8]),
         "can_manage_settings": bool(r[9]), "can_read_log": bool(r[10]),
-        "is_deleted": bool(r[11]), "created_at": format_dt(r[12])
+        "can_save_local": bool(r[11]), "is_hidden": bool(r[12]), "is_deleted": bool(r[13])
     } for r in rows]
     
     # 4. Users
-    await c.execute("SELECT Id, Username, Email, IsApproved, IsActive, CreatedAt, LastConnect FROM Users")
+    await c.execute("SELECT Id, Username, Email, IsApproved, IsActive, FirstConnect, LastConnect FROM Users")
     rows = await c.fetchall()
     users = [{
         "id": r[0], "username": r[1], "email": r[2], "is_approved": bool(r[3]),
         "is_active": bool(r[4]) if r[4] is not None else True,
-        "created_at": format_dt(r[5]), "last_connect": format_dt(r[6])
+        "first_connect": format_dt(r[5]), "created_at": format_dt(r[5]), "last_connect": format_dt(r[6])
     } for r in rows]
     
     # 5. UserGroups
@@ -244,3 +244,111 @@ async def get_database_backup(request: Request, user = Depends(require_manage_se
     
     await log_event(db, "Резервное копирование", user, request.client.host, f"Выгружен бэкап базы данных ({len(entities)} объектов, {len(users)} пользователей).")
     return backup_data
+
+
+@router.post("/restore")
+async def restore_database_backup(request: Request, user = Depends(require_manage_settings), db: PgConnection = Depends(get_db)):
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON in backup payload")
+
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Invalid backup format: expected JSON object")
+
+    entities = data.get("entities", [])
+    groups = data.get("groups", [])
+    entity_permissions = data.get("entity_permissions", [])
+    users = data.get("users", [])
+    user_groups = data.get("user_groups", [])
+    local_tokens = data.get("local_tokens", [])
+    settings = data.get("settings", [])
+
+    c = await db.cursor()
+
+    # 1. Clear and restore Entities
+    await c.execute("DELETE FROM Entities")
+    await c.execute("INSERT INTO Entities (Id, FolderId, EncryptedData, Deleted, Revision) VALUES ('root', '', '', 0, 0) ON CONFLICT (Id) DO NOTHING")
+
+    max_rev = 1
+    for ent in entities:
+        eid = ent.get("id")
+        if not eid or eid == "root":
+            continue
+        folder_id = ent.get("folder_id") or ""
+        enc_data = ent.get("encrypted_data") or ""
+        deleted = 1 if ent.get("deleted") else 0
+        rev = int(ent.get("revision") or 1)
+        if rev > max_rev:
+            max_rev = rev
+        await c.execute("""
+            INSERT INTO Entities (Id, FolderId, EncryptedData, Deleted, Revision)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (Id) DO UPDATE SET
+                FolderId = EXCLUDED.FolderId,
+                EncryptedData = EXCLUDED.EncryptedData,
+                Deleted = EXCLUDED.Deleted,
+                Revision = EXCLUDED.Revision
+        """, (eid, folder_id, enc_data, deleted, rev))
+
+    # 2. Restore Groups if present
+    if groups:
+        for g in groups:
+            gid = g.get("id")
+            if not gid:
+                continue
+            can_roles = int(bool(g.get("can_manage_roles", g.get("can_manage_groups", False))))
+            await c.execute("""
+                INSERT INTO Groups (Id, Name, IsSuperAdmin, CanAdd, CanEdit, CanDelete, CanBulkEdit,
+                                   CanManageUsers, CanManageRoles, CanManageSettings, CanReadLog, CanSaveLocal, IsHidden, IsDeleted)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (Id) DO UPDATE SET
+                    Name = EXCLUDED.Name,
+                    CanAdd = EXCLUDED.CanAdd,
+                    CanEdit = EXCLUDED.CanEdit,
+                    CanDelete = EXCLUDED.CanDelete,
+                    CanBulkEdit = EXCLUDED.CanBulkEdit,
+                    CanManageUsers = EXCLUDED.CanManageUsers,
+                    CanManageRoles = EXCLUDED.CanManageRoles,
+                    CanManageSettings = EXCLUDED.CanManageSettings,
+                    CanReadLog = EXCLUDED.CanReadLog,
+                    CanSaveLocal = EXCLUDED.CanSaveLocal,
+                    IsHidden = EXCLUDED.IsHidden,
+                    IsDeleted = EXCLUDED.IsDeleted
+            """, (gid, g.get("name", ""), int(bool(g.get("is_superadmin"))), int(bool(g.get("can_add", True))),
+                  int(bool(g.get("can_edit", True))), int(bool(g.get("can_delete", True))), int(bool(g.get("can_bulk_edit"))),
+                  int(bool(g.get("can_manage_users"))), can_roles,
+                  int(bool(g.get("can_manage_settings"))), int(bool(g.get("can_read_log"))),
+                  int(bool(g.get("can_save_local", False))), int(bool(g.get("is_hidden", False))), int(bool(g.get("is_deleted", False)))))
+
+    # 3. Restore EntityPermissions
+    if entity_permissions:
+        await c.execute("DELETE FROM EntityPermissions")
+        for ep in entity_permissions:
+            await c.execute("""
+                INSERT INTO EntityPermissions (EntityId, GroupId, AccessLevel)
+                VALUES (?, ?, ?)
+                ON CONFLICT DO NOTHING
+            """, (ep.get("entity_id"), ep.get("group_id"), ep.get("access_level", 2)))
+
+    # 4. Increment and update DbVersion
+    await c.execute("UPDATE DbVersion SET Revision = Revision + 1")
+    await c.execute("SELECT Revision FROM DbVersion LIMIT 1")
+    rev_row = await c.fetchone()
+    new_rev = rev_row[0] if rev_row else max_rev + 1
+
+    await db.commit()
+    new_admin_rev = await increment_admin_revision(db)
+
+    # 5. Broadcast to all clients
+    await manager.broadcast({"event": "new_revision", "revision": new_rev})
+    await manager.broadcast({"event": "admin_revision", "revision": new_admin_rev})
+
+    accessible_ids_cache.clear()
+    rights_cache.clear()
+    tokens_cache.clear()
+    users_cache.clear()
+    settings_cache.clear()
+
+    await log_event(db, "Восстановление", user, request.client.host, f"Успешно восстановлен бэкап: {len(entities)} объектов. Ревизия: {new_rev}")
+    return {"status": "ok", "restored_entities": len(entities), "new_revision": new_rev}
